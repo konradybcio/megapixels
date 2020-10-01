@@ -55,6 +55,7 @@ struct camerainfo {
 	float focallength;
 	float cropfactor;
 	double fnumber;
+	char valid;
 };
 
 static float colormatrix_srgb[] = {
@@ -706,6 +707,8 @@ config_ini_handler(void *user, const char *section, const char *name,
 	struct camerainfo *cc;
 	if (atoi(section) < ARRAY_SIZE(cameras) && atoi(section) >= 0) {
 		cc = &cameras[atoi(section)];
+		cc->valid = 1;
+
 		if (strcmp(name, "width") == 0) {
 			cc->width = strtoint(value, NULL, 10);
 		} else if (strcmp(name, "height") == 0) {
@@ -812,16 +815,23 @@ setup_camera(int camera_id)
 	struct media_link_desc link = {0};
 
 	for (int i = 0; i<ARRAY_SIZE(cameras); i++) {
-		// Disable the interface<->camera link
-		link.flags = 0;
-		link.source.entity = cameras[camera_id].entity_id;
-		link.source.index = 0;
-		link.sink.entity = interface_entity_id;
-		link.sink.index = 0;
 
-		if (xioctl(media_fd, MEDIA_IOC_SETUP_LINK, &link) < 0) {
-			g_printerr("Could not disable camera%i link\n", i);
-			return -1;
+		/* Second check here. Better safe than sorry. */
+
+		if (cameras[i].valid == 0) {
+			/* fall through */
+		} else {
+			// Disable the interface<->camera link
+			link.flags = 0;
+			link.source.entity = cameras[camera_id].entity_id;
+			link.source.index = 0;
+			link.sink.entity = interface_entity_id;
+			link.sink.index = 0;
+
+			if (xioctl(media_fd, MEDIA_IOC_SETUP_LINK, &link) < 0) {
+				g_printerr("Could not disable camera%i link\n", i);
+				return -1;
+			}
 		}
 	}
 
@@ -846,11 +856,15 @@ find_cameras()
 		}
 		printf("At node %s, (0x%x)\n", entity.name, entity.type);
 		for (int i; i<ARRAY_SIZE(cameras); i++) {
-			if (strncmp(entity.name, cameras[i].dev_name, strlen(cameras[i].dev_name)) == 0) {
-				cameras[i].entity_id = entity.id;
-				find_dev_node(entity.dev.major, entity.dev.minor, cameras[i].dev);
-				printf("Found camera%i, is %s at %s\n", i, entity.name, cameras[i].dev);
-				found++;
+			if (cameras[i].valid == 0) {
+				/* fallthrough */
+			} else {
+				if (strncmp(entity.name, cameras[i].dev_name, strlen(cameras[i].dev_name)) == 0) {
+					cameras[i].entity_id = entity.id;
+					find_dev_node(entity.dev.major, entity.dev.minor, cameras[i].dev);
+					printf("Found camera%i, is %s at %s\n", i, entity.name, cameras[i].dev);
+					found++;
+				}
 			}
 		}
 		if (entity.type == MEDIA_ENT_F_IO_V4L) {
@@ -859,7 +873,7 @@ find_cameras()
 			printf("Found v4l2 interface node at %s\n", dev_name);
 		}
 	}
-	if (found < 2) {
+	if (found < 1) {
 		return -1;
 	}
 	return 0;
@@ -947,7 +961,15 @@ on_camera_switch_clicked(GtkWidget *widget, gpointer user_data)
 	stop_capturing(video_fd);
 	close(current.fd);
 
+retry:
 	if (current_camera < ARRAY_SIZE(cameras)) {
+		if (cameras[current_camera].valid == 0) {
+			/* Try again with camera n+1 */
+			current_camera++;
+			goto retry;
+		}
+
+		/* Everything's ok? Set me up! */
 		setup_camera(current_camera);
 		current_camera++;
 	} else {
