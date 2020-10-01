@@ -27,6 +27,9 @@ enum io_method {
 
 #define TIFFTAG_FORWARDMATRIX1 50964
 
+#define ARRAY_SIZE(array) \
+    (sizeof(array) / sizeof(*array))
+
 struct buffer {
 	void *start;
 	size_t length;
@@ -63,8 +66,7 @@ static float colormatrix_srgb[] = {
 struct buffer *buffers;
 static unsigned int n_buffers;
 
-struct camerainfo rear_cam;
-struct camerainfo front_cam;
+struct camerainfo cameras[4]; /* 4 is a sane default for now, raise as needed */
 struct camerainfo current;
 
 // Camera interface
@@ -79,7 +81,7 @@ static char *exif_model;
 // State
 static int ready = 0;
 static int capture = 0;
-static int current_is_rear = 1;
+static int current_camera = 0;
 static cairo_surface_t *surface = NULL;
 static int preview_width = -1;
 static int preview_height = -1;
@@ -702,12 +704,8 @@ config_ini_handler(void *user, const char *section, const char *name,
 	const char *value)
 {
 	struct camerainfo *cc;
-	if (strcmp(section, "rear") == 0 || strcmp(section, "front") == 0) {
-		if (strcmp(section, "rear") == 0) {
-			cc = &rear_cam;
-		} else {
-			cc = &front_cam;
-		}
+	if (atoi(section) < ARRAY_SIZE(cameras) && atoi(section) >= 0) {
+		cc = &cameras[atoi(section)];
 		if (strcmp(name, "width") == 0) {
 			cc->width = strtoint(value, NULL, 10);
 		} else if (strcmp(name, "height") == 0) {
@@ -809,70 +807,25 @@ find_dev_node(int maj, int min, char *fnbuf)
 }
 
 int
-setup_rear()
+setup_camera(int camera_id)
 {
 	struct media_link_desc link = {0};
 
-	// Disable the interface<->front link
-	link.flags = 0;
-	link.source.entity = front_cam.entity_id;
-	link.source.index = 0;
-	link.sink.entity = interface_entity_id;
-	link.sink.index = 0;
+	for (int i = 0; i<ARRAY_SIZE(cameras); i++) {
+		// Disable the interface<->camera link
+		link.flags = 0;
+		link.source.entity = cameras[camera_id].entity_id;
+		link.source.index = 0;
+		link.sink.entity = interface_entity_id;
+		link.sink.index = 0;
 
-	if (xioctl(media_fd, MEDIA_IOC_SETUP_LINK, &link) < 0) {
-		g_printerr("Could not disable front camera link\n");
-		return -1;
+		if (xioctl(media_fd, MEDIA_IOC_SETUP_LINK, &link) < 0) {
+			g_printerr("Could not disable camera%i link\n", i);
+			return -1;
+		}
 	}
 
-	// Enable the interface<->rear link
-	link.flags = MEDIA_LNK_FL_ENABLED;
-	link.source.entity = rear_cam.entity_id;
-	link.source.index = 0;
-	link.sink.entity = interface_entity_id;
-	link.sink.index = 0;
-
-	if (xioctl(media_fd, MEDIA_IOC_SETUP_LINK, &link) < 0) {
-		g_printerr("Could not enable rear camera link\n");
-		return -1;
-	}
-
-	current = rear_cam;
-
-	// Find camera node
-	init_sensor(current.dev, current.width, current.height, current.mbus, current.rate);
-	return 0;
-}
-
-int
-setup_front()
-{
-	struct media_link_desc link = {0};
-
-	// Disable the interface<->rear link
-	link.flags = 0;
-	link.source.entity = rear_cam.entity_id;
-	link.source.index = 0;
-	link.sink.entity = interface_entity_id;
-	link.sink.index = 0;
-
-	if (xioctl(media_fd, MEDIA_IOC_SETUP_LINK, &link) < 0) {
-		g_printerr("Could not disable rear camera link\n");
-		return -1;
-	}
-
-	// Enable the interface<->rear link
-	link.flags = MEDIA_LNK_FL_ENABLED;
-	link.source.entity = front_cam.entity_id;
-	link.source.index = 0;
-	link.sink.entity = interface_entity_id;
-	link.sink.index = 0;
-
-	if (xioctl(media_fd, MEDIA_IOC_SETUP_LINK, &link) < 0) {
-		g_printerr("Could not enable front camera link\n");
-		return -1;
-	}
-	current = front_cam;
+	current = cameras[camera_id];
 	// Find camera node
 	init_sensor(current.dev, current.width, current.height, current.mbus, current.rate);
 	return 0;
@@ -892,17 +845,13 @@ find_cameras()
 			break;
 		}
 		printf("At node %s, (0x%x)\n", entity.name, entity.type);
-		if (strncmp(entity.name, front_cam.dev_name, strlen(front_cam.dev_name)) == 0) {
-			front_cam.entity_id = entity.id;
-			find_dev_node(entity.dev.major, entity.dev.minor, front_cam.dev);
-			printf("Found front cam, is %s at %s\n", entity.name, front_cam.dev);
-			found++;
-		}
-		if (strncmp(entity.name, rear_cam.dev_name, strlen(rear_cam.dev_name)) == 0) {
-			rear_cam.entity_id = entity.id;
-			find_dev_node(entity.dev.major, entity.dev.minor, rear_cam.dev);
-			printf("Found rear cam, is %s at %s\n", entity.name, rear_cam.dev);
-			found++;
+		for (int i; i<ARRAY_SIZE(cameras); i++) {
+			if (strncmp(entity.name, cameras[i].dev_name, strlen(cameras[i].dev_name)) == 0) {
+				cameras[i].entity_id = entity.id;
+				find_dev_node(entity.dev.major, entity.dev.minor, cameras[i].dev);
+				printf("Found camera%i, is %s at %s\n", i, entity.name, cameras[i].dev);
+				found++;
+			}
 		}
 		if (entity.type == MEDIA_ENT_F_IO_V4L) {
 			interface_entity_id = entity.id;
@@ -997,13 +946,15 @@ on_camera_switch_clicked(GtkWidget *widget, gpointer user_data)
 {
 	stop_capturing(video_fd);
 	close(current.fd);
-	if (current_is_rear == 1) {
-		setup_front();
-		current_is_rear = 0;
+
+	if (current_camera < ARRAY_SIZE(cameras)) {
+		setup_camera(current_camera);
+		current_camera++;
 	} else {
-		setup_rear();
-		current_is_rear = 1;
+		setup_camera(0);
+		current_camera = 0;
 	}
+
 	close(video_fd);
 	video_fd = open(dev_name, O_RDWR);
 	if (video_fd == -1) {
@@ -1220,7 +1171,7 @@ main(int argc, char *argv[])
 		show_error("Could not find the cameras");
 		goto failed;
 	}
-	setup_rear();
+	setup_camera(0); /* Treat 0 as the default camera */
 
 	int fd = open(dev_name, O_RDWR);
 	if (fd == -1) {
